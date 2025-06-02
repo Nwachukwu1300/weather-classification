@@ -1,0 +1,10 @@
+tensorflow-macos
+tensorflow-metal
+tensorflow-hub
+torch
+torchvision
+transformers
+scikit-learn
+matplotlib
+pillow
+pandas
