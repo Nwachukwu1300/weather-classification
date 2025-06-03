@@ -8,8 +8,10 @@ import time
 import tensorflow as tf
 import tensorflow_hub as hub
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import ResNet50
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import seaborn as sns
+from sklearn.metrics import accuracy_score, recall_score, f1_score, precision_score
 
 BASE_DIR = Path(os.getcwd())
 # CSV files with dataset splits
@@ -133,7 +135,7 @@ def train_evaluate_resnet():
         return hub.KerasLayer(RESNET_URL, trainable=False)(x)
 
     inputs = tf.keras.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
-    x = tf.keras.layers.Lambda(hub_layer)(inputs)
+    x = tf.keras.layers.Lambda(hub_layer, output_shape=(2048,))(inputs)
     x = tf.keras.layers.Dense(512, activation='relu')(x)
     x = tf.keras.layers.Dropout(0.5)(x)
     outputs = tf.keras.layers.Dense(len(CLASS_NAMES), activation='softmax')(x)
@@ -188,6 +190,16 @@ def train_evaluate_resnet():
     # creating confusion matrix
     cm = confusion_matrix(true_classes, predicted_classes)
     
+    # --- Additional evaluation metrics ---
+    print("\nEvaluation Metrics:")
+    print(f"Accuracy: {accuracy_score(true_classes, predicted_classes):.4f}")
+    print(f"Sensitivity (Recall, macro): {recall_score(true_classes, predicted_classes, average='macro'):.4f}")
+    print(f"Sensitivity (Recall, micro): {recall_score(true_classes, predicted_classes, average='micro'):.4f}")
+    print(f"F1 Score (macro): {f1_score(true_classes, predicted_classes, average='macro'):.4f}")
+    print(f"F1 Score (micro): {f1_score(true_classes, predicted_classes, average='micro'):.4f}")
+    print(f"Precision (macro): {precision_score(true_classes, predicted_classes, average='macro'):.4f}")
+    print(f"Precision (micro): {precision_score(true_classes, predicted_classes, average='micro'):.4f}")
+    
     # creating plots directory if it doesn't exist
     plots_dir = BASE_DIR / 'plots'
     plots_dir.mkdir(exist_ok=True)
@@ -220,214 +232,255 @@ def train_evaluate_resnet():
     
     return resnet_model
 
+def create_vision_transformer(image_size, patch_size, num_patches, projection_dim, num_heads, transformer_units, transformer_layers, mlp_head_units):
+    """Create a Vision Transformer model"""
+    
+    def mlp(x, hidden_units, dropout_rate):
+        for units in hidden_units:
+            x = tf.keras.layers.Dense(units, activation='gelu')(x)
+            x = tf.keras.layers.Dropout(dropout_rate)(x)
+        return x
+    
+    class Patches(tf.keras.layers.Layer):
+        def __init__(self, patch_size):
+            super(Patches, self).__init__()
+            self.patch_size = patch_size
+        
+        def call(self, images):
+            batch_size = tf.shape(images)[0]
+            patches = tf.image.extract_patches(
+                images=images,
+                sizes=[1, self.patch_size, self.patch_size, 1],
+                strides=[1, self.patch_size, self.patch_size, 1],
+                rates=[1, 1, 1, 1],
+                padding="VALID",
+            )
+            patch_dims = patches.shape[-1]
+            patches = tf.reshape(patches, [batch_size, -1, patch_dims])
+            return patches
+    
+    class PatchEncoder(tf.keras.layers.Layer):
+        def __init__(self, num_patches, projection_dim):
+            super(PatchEncoder, self).__init__()
+            self.num_patches = num_patches
+            self.projection = tf.keras.layers.Dense(units=projection_dim)
+            self.position_embedding = tf.keras.layers.Embedding(
+                input_dim=num_patches, output_dim=projection_dim
+            )
+        
+        def call(self, patch):
+            positions = tf.range(start=0, limit=self.num_patches, delta=1)
+            encoded = self.projection(patch) + self.position_embedding(positions)
+            return encoded
+    
+    inputs = tf.keras.layers.Input(shape=(image_size, image_size, 3))
+    
+    # Create patches
+    patches = Patches(patch_size)(inputs)
+    
+    # Encode patches
+    encoded_patches = PatchEncoder(num_patches, projection_dim)(patches)
+    
+    # Create multiple layers of the Transformer block
+    for _ in range(transformer_layers):
+        # Layer normalization 1
+        x1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
+        
+        # Create a multi-head attention layer
+        attention_output = tf.keras.layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=projection_dim, dropout=0.1
+        )(x1, x1)
+        
+        # Skip connection 1
+        x2 = tf.keras.layers.Add()([attention_output, encoded_patches])
+        
+        # Layer normalization 2
+        x3 = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x2)
+        
+        # MLP
+        x3 = mlp(x3, hidden_units=transformer_units, dropout_rate=0.1)
+        
+        # Skip connection 2
+        encoded_patches = tf.keras.layers.Add()([x3, x2])
+    
+    # Create a [batch_size, projection_dim] tensor
+    representation = tf.keras.layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
+    representation = tf.keras.layers.GlobalAveragePooling1D()(representation)
+    representation = tf.keras.layers.Dropout(0.5)(representation)
+    
+    # Add MLP
+    features = mlp(representation, hidden_units=mlp_head_units, dropout_rate=0.5)
+    
+    # Classify outputs
+    logits = tf.keras.layers.Dense(NUM_CLASSES, activation='softmax')(features)
+    
+    # Create the Keras model
+    model = tf.keras.Model(inputs=inputs, outputs=logits)
+    return model
+
 def train_evaluate_vit():
-    """Train and evaluate Vision Transformer model using HuggingFace"""
-    from transformers import ViTFeatureExtractor, ViTForImageClassification
-    import torch
-    from torch.utils.data import DataLoader, Dataset
-    from torchvision import transforms
-    
-    print("\n" + "="*50)
+    """Train and evaluate Vision Transformer model using custom implementation"""
+    print("\n==================================================")
     print("TRAINING VISION TRANSFORMER MODEL")
-    print("="*50)
+    print("==================================================")
     
-    # checking for GPU
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    # ViT hyperparameters
+    image_size = IMG_SIZE
+    patch_size = 16
+    num_patches = (image_size // patch_size) ** 2
+    projection_dim = 64
+    num_heads = 4
+    transformer_units = [
+        projection_dim * 2,
+        projection_dim,
+    ]
+    transformer_layers = 8
+    mlp_head_units = [2048, 1024]
     
-    # creating directory for models if it doesn't exist
-    models_dir = BASE_DIR / 'models'
-    models_dir.mkdir(exist_ok=True)
+    # loading datasets
+    train_df = load_dataset_from_csv(TRAIN_CSV, is_training=True)
+    val_df = load_dataset_from_csv(VAL_CSV)
+    test_df = load_dataset_from_csv(TEST_CSV)
     
-    # creating custom dataset class
-    class WeatherDataset(Dataset):
-        def __init__(self, csv_file, feature_extractor):
-            self.df = pd.read_csv(csv_file)
-            # converting relative paths to absolute
-            self.df['filepath'] = self.df['filepath'].apply(lambda x: str(BASE_DIR / x))
-            self.feature_extractor = feature_extractor
-            
-        def __len__(self):
-            return len(self.df)
-        
-        def __getitem__(self, idx):
-            # getting image path and label
-            img_path = self.df.iloc[idx]['filepath']
-            label = self.df.iloc[idx]['label']
-            
-            # opening image
-            image = Image.open(img_path).convert('RGB')
-            
-            # processing image
-            encoding = self.feature_extractor(image, return_tensors='pt')
-            # removing batch dimension
-            for k, v in encoding.items():
-                encoding[k] = v.squeeze()
-                
-            return {
-                'pixel_values': encoding['pixel_values'],
-                'labels': torch.tensor(label, dtype=torch.long)
-            }
-    
-    # loading feature extractor
-    print("Loading ViT feature extractor...")
-    feature_extractor = ViTFeatureExtractor.from_pretrained(
-        'google/vit-base-patch16-224-in21k'
+    # creating data generators
+    train_datagen = ImageDataGenerator(
+        rescale=1./255,
+        validation_split=0.0
     )
     
-    # loading model
-    print("Loading ViT model...")
-    vit_model = ViTForImageClassification.from_pretrained(
-        'google/vit-base-patch16-224-in21k',
-        num_labels=NUM_CLASSES,
-        id2label={i: name for i, name in enumerate(CLASS_NAMES)},
-        label2id={name: i for i, name in enumerate(CLASS_NAMES)}
+    train_generator = train_datagen.flow_from_dataframe(
+        dataframe=train_df,
+        x_col="filepath",
+        y_col="label",
+        target_size=(IMG_SIZE, IMG_SIZE),
+        batch_size=BATCH_SIZE,
+        class_mode="sparse",
+        shuffle=True
     )
-    vit_model = vit_model.to(device)
     
-    # creating datasets
-    print("Creating datasets...")
-    train_dataset = WeatherDataset(TRAIN_CSV, feature_extractor)
-    val_dataset = WeatherDataset(VAL_CSV, feature_extractor)
-    test_dataset = WeatherDataset(TEST_CSV, feature_extractor)
+    val_generator = train_datagen.flow_from_dataframe(
+        dataframe=val_df,
+        x_col="filepath",
+        y_col="label",
+        target_size=(IMG_SIZE, IMG_SIZE),
+        batch_size=BATCH_SIZE,
+        class_mode="sparse",
+        shuffle=False
+    )
     
-    # creating data loaders
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
+    test_generator = train_datagen.flow_from_dataframe(
+        dataframe=test_df,
+        x_col="filepath",
+        y_col="label",
+        target_size=(IMG_SIZE, IMG_SIZE),
+        batch_size=BATCH_SIZE,
+        class_mode="sparse",
+        shuffle=False
+    )
     
-    print(f"Training on {len(train_dataset)} samples")
-    print(f"Validating on {len(val_dataset)} samples")
-    print(f"Testing on {len(test_dataset)} samples")
+    print("Building Vision Transformer model...")
     
-    # setting up optimizer
-    optimizer = torch.optim.AdamW(vit_model.parameters(), lr=5e-5)
+    # creating the custom ViT model
+    vit_model = create_vision_transformer(
+        image_size=image_size,
+        patch_size=patch_size,
+        num_patches=num_patches,
+        projection_dim=projection_dim,
+        num_heads=num_heads,
+        transformer_units=transformer_units,
+        transformer_layers=transformer_layers,
+        mlp_head_units=mlp_head_units
+    )
     
-    # training loop
-    print(f"Training ViT model for {EPOCHS} epochs...")
-    best_val_accuracy = 0.0
-    history = {
-        'accuracy': [],
-        'val_accuracy': [],
-        'loss': [],
-        'val_loss': []
-    }
+    # compiling model with a lower learning rate for ViT
+    vit_model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE * 0.1),  # Lower LR for ViT
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
     
-    start_time = time.time()
+    # creating callbacks
+    callbacks = [
+        tf.keras.callbacks.ModelCheckpoint(
+            'best_vit_model.h5',
+            monitor='val_accuracy',
+            save_best_only=True,
+            mode='max'
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=7,  # More patience for ViT
+            restore_best_weights=True
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.3,
+            patience=4
+        )
+    ]
     
-    for epoch in range(EPOCHS):
-        print(f"Epoch {epoch+1}/{EPOCHS}")
-        
-        # training phase
-        vit_model.train()
-        train_loss = 0.0
-        train_correct = 0
-        train_total = 0
-        
-        for batch in train_loader:
-            pixel_values = batch['pixel_values'].to(device)
-            labels = batch['labels'].to(device)
-            
-            # zero gradients
-            optimizer.zero_grad()
-            
-            # forward pass
-            outputs = vit_model(pixel_values=pixel_values, labels=labels)
-            loss = outputs.loss
-            
-            # backward pass
-            loss.backward()
-            optimizer.step()
-            
-            # tracking statistics
-            train_loss += loss.item()
-            _, predicted = outputs.logits.max(1)
-            train_total += labels.size(0)
-            train_correct += predicted.eq(labels).sum().item()
-        
-        # Calculate training metrics
-        epoch_train_loss = train_loss / len(train_loader)
-        epoch_train_acc = train_correct / train_total
-        
-        # validation phase
-        vit_model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-        
-        with torch.no_grad():
-            for batch in val_loader:
-                pixel_values = batch['pixel_values'].to(device)
-                labels = batch['labels'].to(device)
-                
-                outputs = vit_model(pixel_values=pixel_values, labels=labels)
-                loss = outputs.loss
-                
-                val_loss += loss.item()
-                _, predicted = outputs.logits.max(1)
-                val_total += labels.size(0)
-                val_correct += predicted.eq(labels).sum().item()
-        
-        # calculating validation metrics
-        epoch_val_loss = val_loss / len(val_loader)
-        epoch_val_acc = val_correct / val_total
-        
-        # updating history
-        history['accuracy'].append(epoch_train_acc)
-        history['val_accuracy'].append(epoch_val_acc)
-        history['loss'].append(epoch_train_loss)
-        history['val_loss'].append(epoch_val_loss)
-        
-        print(f"Train Loss: {epoch_train_loss:.4f}, Train Acc: {epoch_train_acc:.4f}")
-        print(f"Val Loss: {epoch_val_loss:.4f}, Val Acc: {epoch_val_acc:.4f}")
-        
-        # saving best model
-        if epoch_val_acc > best_val_accuracy:
-            best_val_accuracy = epoch_val_acc
-            torch.save(vit_model.state_dict(), models_dir / 'vit_best.pt')
-            print(f"Saved best model with validation accuracy: {best_val_accuracy:.4f}")
+    # training model
+    print("Starting ViT training...")
+    history = vit_model.fit(
+        train_generator,
+        validation_data=val_generator,
+        epochs=EPOCHS,
+        callbacks=callbacks
+    )
     
-    training_time = time.time() - start_time
-    print(f"Training completed in {training_time:.2f} seconds")
+    # evaluating model
+    test_loss, test_accuracy = vit_model.evaluate(test_generator)
+    print(f"\nViT Test accuracy: {test_accuracy:.4f}")
     
-    # saving final model
-    torch.save(vit_model.state_dict(), models_dir / 'vit_final.pt')
-    print(f"Final model saved to {models_dir / 'vit_final.pt'}")
+    # getting predictions for confusion matrix
+    print("\nGenerating ViT confusion matrix...")
+    predictions = vit_model.predict(test_generator)
+    predicted_classes = np.argmax(predictions, axis=1)
+    true_classes = test_generator.classes
     
-    # loading best model for evaluation
-    vit_model.load_state_dict(torch.load(models_dir / 'vit_best.pt'))
+    # creating confusion matrix
+    cm = confusion_matrix(true_classes, predicted_classes)
     
-    # evaluating on test set
-    print("Evaluating on test set...")
-    vit_model.eval()
-    test_loss = 0.0
-    test_correct = 0
-    test_total = 0
+    print("\nEvaluation Metrics:")
+    print(f"Accuracy: {accuracy_score(true_classes, predicted_classes):.4f}")
+    print(f"Sensitivity (Recall, macro): {recall_score(true_classes, predicted_classes, average='macro'):.4f}")
+    print(f"Sensitivity (Recall, micro): {recall_score(true_classes, predicted_classes, average='micro'):.4f}")
+    print(f"F1 Score (macro): {f1_score(true_classes, predicted_classes, average='macro'):.4f}")
+    print(f"F1 Score (micro): {f1_score(true_classes, predicted_classes, average='micro'):.4f}")
+    print(f"Precision (macro): {precision_score(true_classes, predicted_classes, average='macro'):.4f}")
+    print(f"Precision (micro): {precision_score(true_classes, predicted_classes, average='micro'):.4f}")
+
+    # creating plots directory if it doesn't exist
+    plots_dir = BASE_DIR / 'plots'
+    plots_dir.mkdir(exist_ok=True)
     
-    with torch.no_grad():
-        for batch in test_loader:
-            pixel_values = batch['pixel_values'].to(device)
-            labels = batch['labels'].to(device)
-            
-            outputs = vit_model(pixel_values=pixel_values, labels=labels)
-            loss = outputs.loss
-            
-            test_loss += loss.item()
-            _, predicted = outputs.logits.max(1)
-            test_total += labels.size(0)
-            test_correct += predicted.eq(labels).sum().item()
+    # plotting confusion matrix
+    plt.figure(figsize=(12, 10))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=CLASS_NAMES)
+    disp.plot(
+        cmap='Blues',  
+        values_format='d',
+        include_values=True,
+        xticks_rotation=45,
+        colorbar=True,
+        text_kw={'size': 12},
+        im_kw={'vmin': 0}
+    )
+    plt.title('Vision Transformer Confusion Matrix', pad=20, size=14, weight='bold')
+    plt.ylabel('True Label', size=12, weight='bold')
+    plt.xlabel('Predicted Label', size=12, weight='bold')
+    plt.tight_layout()
     
-    test_accuracy = test_correct / test_total
-    test_loss = test_loss / len(test_loader)
+    # saving confusion matrix plot
+    plt.savefig(plots_dir / 'vit_confusion_matrix.png', dpi=300, bbox_inches='tight')
+    plt.close()
     
-    print(f"Test accuracy: {test_accuracy:.4f}")
-    print(f"Test loss: {test_loss:.4f}")
+    print(f"ViT Confusion matrix saved to {plots_dir / 'vit_confusion_matrix.png'}")
     
     # saving training plots
     save_training_plots(history, 'ViT')
     
-    # returning the model and feature extractor for later use
-    return vit_model, feature_extractor
+    return vit_model
 
 
 if __name__ == "__main__":
@@ -437,16 +490,16 @@ if __name__ == "__main__":
     print(f"CSV files: {TRAIN_CSV}, {VAL_CSV}, {TEST_CSV}")
     
     # choosing which model to train
-    train_resnet = True  # Set to False to skip ResNet training
-    train_vit = False    # Set to False to skip ViT training
+    train_resnet = True    # Set to False to skip ResNet training
+    train_vit = True      # Set to False to skip ViT training
     
     # training models
     if train_resnet:
         resnet_model = train_evaluate_resnet()
     
     if train_vit:
-        vit_model, feature_extractor = train_evaluate_vit()
+        vit_model = train_evaluate_vit()
     
     print("\nTraining complete!")
-    print("Models are saved in the 'models' directory")
+    print("Models are saved in the current directory and 'models' directory")
     print("Training plots are saved in the 'plots' directory")
