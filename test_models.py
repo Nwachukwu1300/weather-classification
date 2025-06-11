@@ -12,6 +12,12 @@ from tensorflow.keras.applications import ResNet50
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import seaborn as sns
 from sklearn.metrics import accuracy_score, recall_score, f1_score, precision_score
+from sklearn.metrics import classification_report
+from transformers import ViTImageProcessor, ViTForImageClassification
+import torch
+from torch.utils.data import Dataset, DataLoader
+import optuna
+from optuna.trial import Trial
 
 BASE_DIR = Path(os.getcwd())
 # CSV files with dataset splits
@@ -81,16 +87,19 @@ def save_training_plots(history, model_name):
     
     print(f"Training plots saved to {plots_dir / f'{model_name}_training_history.png'}")
 
-def train_evaluate_resnet():
-    """Train and evaluate ResNet model"""
-    print("\n==================================================")
-    print("TRAINING RESNET MODEL")
-    print("==================================================")
+def objective(trial: Trial):
+    """Optuna objective function for hyperparameter optimization"""
+    # defining hyperparameters to optimize
+    learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-3, log=True)
+    dropout_rate = trial.suggest_float('dropout_rate', 0.2, 0.7)
+    dense_units = trial.suggest_int('dense_units', 256, 1024)
+    batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
+    num_dense_layers = trial.suggest_int('num_dense_layers', 1, 3)
+    dense_units_multiplier = trial.suggest_float('dense_units_multiplier', 0.5, 1.0)
     
     # loading datasets
     train_df = load_dataset_from_csv(TRAIN_CSV, is_training=True)
     val_df = load_dataset_from_csv(VAL_CSV)
-    test_df = load_dataset_from_csv(TEST_CSV)
     
     # creating data generators
     train_datagen = ImageDataGenerator(
@@ -103,7 +112,7 @@ def train_evaluate_resnet():
         x_col="filepath",
         y_col="label",
         target_size=(IMG_SIZE, IMG_SIZE),
-        batch_size=BATCH_SIZE,
+        batch_size=batch_size,
         class_mode="sparse",
         shuffle=True
     )
@@ -113,7 +122,126 @@ def train_evaluate_resnet():
         x_col="filepath",
         y_col="label",
         target_size=(IMG_SIZE, IMG_SIZE),
-        batch_size=BATCH_SIZE,
+        batch_size=batch_size,
+        class_mode="sparse",
+        shuffle=False
+    )
+    
+    # creating the base model
+    def hub_layer(x):
+        return hub.KerasLayer(RESNET_URL, trainable=False)(x)
+
+    inputs = tf.keras.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
+    x = tf.keras.layers.Lambda(hub_layer, output_shape=(2048,))(inputs)
+    
+    # Add multiple dense layers with decreasing units
+    current_units = dense_units
+    for i in range(num_dense_layers):
+        x = tf.keras.layers.Dense(current_units, activation='relu')(x)
+        x = tf.keras.layers.Dropout(dropout_rate)(x)
+        current_units = int(current_units * dense_units_multiplier)
+    
+    outputs = tf.keras.layers.Dense(len(CLASS_NAMES), activation='softmax')(x)
+
+    resnet_model = tf.keras.Model(inputs, outputs)
+    
+    # compiling model
+    resnet_model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    # creating callbacks with more patient early stopping for better accuracy
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor='val_accuracy',
+            patience=5,  # Increased patience for better convergence
+            restore_best_weights=True,
+            min_delta=0.0005  # Smaller delta for more precise stopping
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.2,
+            patience=3,  # Increased patience for learning rate reduction
+            min_delta=0.0005
+        )
+    ]
+    
+    # training model with more epochs for optimization
+    history = resnet_model.fit(
+        train_generator,
+        validation_data=val_generator,
+        epochs=10,  # Increased epochs for better convergence
+        callbacks=callbacks,
+        verbose=0
+    )
+    
+    # Return validation accuracy as the objective value
+    return max(history.history['val_accuracy'])
+
+def train_evaluate_resnet():
+    """Train and evaluate ResNet model with Optuna optimization"""
+    print("\n==================================================")
+    print("OPTIMIZING RESNET MODEL WITH OPTUNA")
+    print("==================================================")
+    
+    # Create Optuna study with more patient pruner
+    study = optuna.create_study(
+        direction='maximize',
+        pruner=optuna.pruners.MedianPruner(
+            n_startup_trials=5,  # More startup trials
+            n_warmup_steps=3,    # More warmup steps
+            interval_steps=1
+        )
+    )
+    
+    # Run optimization with longer timeout
+    study.optimize(
+        objective,
+        n_trials=10,
+        timeout=72000,  # Increased to 2 hours
+        show_progress_bar=True
+    )
+    
+    print("\nBest trial:")
+    trial = study.best_trial
+    
+    print("  Value: ", trial.value)
+    print("  Params: ")
+    for key, value in trial.params.items():
+        print(f"    {key}: {value}")
+    
+    # Train final model with best parameters
+    print("\nTraining final model with best parameters...")
+    
+    # loading datasets
+    train_df = load_dataset_from_csv(TRAIN_CSV, is_training=True)
+    val_df = load_dataset_from_csv(VAL_CSV)
+    test_df = load_dataset_from_csv(TEST_CSV)
+    
+    # creating data generators with best batch size
+    train_datagen = ImageDataGenerator(
+        rescale=1./255,
+        validation_split=0.0
+    )
+    
+    train_generator = train_datagen.flow_from_dataframe(
+        dataframe=train_df,
+        x_col="filepath",
+        y_col="label",
+        target_size=(IMG_SIZE, IMG_SIZE),
+        batch_size=trial.params['batch_size'],
+        class_mode="sparse",
+        shuffle=True
+    )
+    
+    val_generator = train_datagen.flow_from_dataframe(
+        dataframe=val_df,
+        x_col="filepath",
+        y_col="label",
+        target_size=(IMG_SIZE, IMG_SIZE),
+        batch_size=trial.params['batch_size'],
         class_mode="sparse",
         shuffle=False
     )
@@ -123,33 +251,37 @@ def train_evaluate_resnet():
         x_col="filepath",
         y_col="label",
         target_size=(IMG_SIZE, IMG_SIZE),
-        batch_size=BATCH_SIZE,
+        batch_size=trial.params['batch_size'],
         class_mode="sparse",
         shuffle=False
     )
     
-    print("Building ResNet model...")
-    
-    # creating the base model using a Lambda wrapper to avoid symbolic tensor issues
+    # creating the base model with best parameters
     def hub_layer(x):
         return hub.KerasLayer(RESNET_URL, trainable=False)(x)
 
     inputs = tf.keras.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
     x = tf.keras.layers.Lambda(hub_layer, output_shape=(2048,))(inputs)
-    x = tf.keras.layers.Dense(512, activation='relu')(x)
-    x = tf.keras.layers.Dropout(0.5)(x)
+    
+    # Add multiple dense layers with best parameters
+    current_units = trial.params['dense_units']
+    for i in range(trial.params['num_dense_layers']):
+        x = tf.keras.layers.Dense(current_units, activation='relu')(x)
+        x = tf.keras.layers.Dropout(trial.params['dropout_rate'])(x)
+        current_units = int(current_units * trial.params['dense_units_multiplier'])
+    
     outputs = tf.keras.layers.Dense(len(CLASS_NAMES), activation='softmax')(x)
 
     resnet_model = tf.keras.Model(inputs, outputs)
     
-    # compiling model
+    # compiling model with best learning rate
     resnet_model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=trial.params['learning_rate']),
         loss='sparse_categorical_crossentropy',
         metrics=['accuracy']
     )
     
-    # creating callbacks
+    # creating callbacks for final training with more patient settings
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
             'best_resnet_model.h5',
@@ -159,17 +291,18 @@ def train_evaluate_resnet():
         ),
         tf.keras.callbacks.EarlyStopping(
             monitor='val_loss',
-            patience=5,
+            patience=7,  # Increased patience for final training
             restore_best_weights=True
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
             monitor='val_loss',
             factor=0.2,
-            patience=3
+            patience=4,  # Increased patience for learning rate reduction
+            min_delta=0.0005  # Smaller delta for more precise stopping
         )
     ]
     
-    # training model
+    # training final model with more epochs
     history = resnet_model.fit(
         train_generator,
         validation_data=val_generator,
@@ -177,7 +310,6 @@ def train_evaluate_resnet():
         callbacks=callbacks
     )
     
-    # evaluating model
     test_loss, test_accuracy = resnet_model.evaluate(test_generator)
     print(f"\nTest accuracy: {test_accuracy:.4f}")
     
@@ -193,12 +325,16 @@ def train_evaluate_resnet():
     # --- Additional evaluation metrics ---
     print("\nEvaluation Metrics:")
     print(f"Accuracy: {accuracy_score(true_classes, predicted_classes):.4f}")
-    print(f"Sensitivity (Recall, macro): {recall_score(true_classes, predicted_classes, average='macro'):.4f}")
-    print(f"Sensitivity (Recall, micro): {recall_score(true_classes, predicted_classes, average='micro'):.4f}")
+    print(f"Recall (macro): {recall_score(true_classes, predicted_classes, average='macro'):.4f}")
+    print(f"Recall (micro): {recall_score(true_classes, predicted_classes, average='micro'):.4f}")
     print(f"F1 Score (macro): {f1_score(true_classes, predicted_classes, average='macro'):.4f}")
     print(f"F1 Score (micro): {f1_score(true_classes, predicted_classes, average='micro'):.4f}")
     print(f"Precision (macro): {precision_score(true_classes, predicted_classes, average='macro'):.4f}")
     print(f"Precision (micro): {precision_score(true_classes, predicted_classes, average='micro'):.4f}")
+    
+    # --- Per-class metrics ---
+    print("\nDetailed Classification Report (per class):")
+    print(classification_report(true_classes, predicted_classes, target_names=CLASS_NAMES, digits=4))
     
     # creating plots directory if it doesn't exist
     plots_dir = BASE_DIR / 'plots'
@@ -208,13 +344,13 @@ def train_evaluate_resnet():
     plt.figure(figsize=(12, 10))
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=CLASS_NAMES)
     disp.plot(
-        cmap='YlOrRd',  # Warmer colors for better visibility
-        values_format='d',  # Integer format for counts
+        cmap='YlOrRd',
+        values_format='d',
         include_values=True,
-        xticks_rotation=45,  # Rotate labels for better readability
+        xticks_rotation=45,
         colorbar=True,
-        text_kw={'size': 12},  # Larger text size
-        im_kw={'vmin': 0}  # Start color scale from 0
+        text_kw={'size': 12},
+        im_kw={'vmin': 0}
     )
     plt.title('ResNet Confusion Matrix', pad=20, size=14, weight='bold')
     plt.ylabel('True Label', size=12, weight='bold')
@@ -319,146 +455,152 @@ def create_vision_transformer(image_size, patch_size, num_patches, projection_di
     return model
 
 def train_evaluate_vit():
-    """Train and evaluate Vision Transformer model using custom implementation"""
+    """Train and evaluate Vision Transformer model using Hugging Face google/vit-base-patch16-224"""
     print("\n==================================================")
-    print("TRAINING VISION TRANSFORMER MODEL")
+    print("TRAINING VISION TRANSFORMER MODEL (Hugging Face)")
     print("==================================================")
-    
-    # ViT hyperparameters
-    image_size = IMG_SIZE
-    patch_size = 16
-    num_patches = (image_size // patch_size) ** 2
-    projection_dim = 64
-    num_heads = 4
-    transformer_units = [
-        projection_dim * 2,
-        projection_dim,
-    ]
-    transformer_layers = 8
-    mlp_head_units = [2048, 1024]
-    
-    # loading datasets
+
+    # Load datasets
     train_df = load_dataset_from_csv(TRAIN_CSV, is_training=True)
     val_df = load_dataset_from_csv(VAL_CSV)
     test_df = load_dataset_from_csv(TEST_CSV)
-    
-    # creating data generators
-    train_datagen = ImageDataGenerator(
-        rescale=1./255,
-        validation_split=0.0
-    )
-    
-    train_generator = train_datagen.flow_from_dataframe(
-        dataframe=train_df,
-        x_col="filepath",
-        y_col="label",
-        target_size=(IMG_SIZE, IMG_SIZE),
-        batch_size=BATCH_SIZE,
-        class_mode="sparse",
-        shuffle=True
-    )
-    
-    val_generator = train_datagen.flow_from_dataframe(
-        dataframe=val_df,
-        x_col="filepath",
-        y_col="label",
-        target_size=(IMG_SIZE, IMG_SIZE),
-        batch_size=BATCH_SIZE,
-        class_mode="sparse",
-        shuffle=False
-    )
-    
-    test_generator = train_datagen.flow_from_dataframe(
-        dataframe=test_df,
-        x_col="filepath",
-        y_col="label",
-        target_size=(IMG_SIZE, IMG_SIZE),
-        batch_size=BATCH_SIZE,
-        class_mode="sparse",
-        shuffle=False
-    )
-    
-    print("Building Vision Transformer model...")
-    
-    # creating the custom ViT model
-    vit_model = create_vision_transformer(
-        image_size=image_size,
-        patch_size=patch_size,
-        num_patches=num_patches,
-        projection_dim=projection_dim,
-        num_heads=num_heads,
-        transformer_units=transformer_units,
-        transformer_layers=transformer_layers,
-        mlp_head_units=mlp_head_units
-    )
-    
-    # compiling model with a lower learning rate for ViT
-    vit_model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE * 0.1),  # Lower LR for ViT
-        loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
-    )
-    
-    # creating callbacks
-    callbacks = [
-        tf.keras.callbacks.ModelCheckpoint(
-            'best_vit_model.h5',
-            monitor='val_accuracy',
-            save_best_only=True,
-            mode='max'
-        ),
-        tf.keras.callbacks.EarlyStopping(
-            monitor='val_loss',
-            patience=7,  # More patience for ViT
-            restore_best_weights=True
-        ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss',
-            factor=0.3,
-            patience=4
-        )
-    ]
-    
-    # training model
-    print("Starting ViT training...")
-    history = vit_model.fit(
-        train_generator,
-        validation_data=val_generator,
-        epochs=EPOCHS,
-        callbacks=callbacks
-    )
-    
-    # evaluating model
-    test_loss, test_accuracy = vit_model.evaluate(test_generator)
-    print(f"\nViT Test accuracy: {test_accuracy:.4f}")
-    
-    # getting predictions for confusion matrix
-    print("\nGenerating ViT confusion matrix...")
-    predictions = vit_model.predict(test_generator)
-    predicted_classes = np.argmax(predictions, axis=1)
-    true_classes = test_generator.classes
-    
-    # creating confusion matrix
-    cm = confusion_matrix(true_classes, predicted_classes)
-    
-    print("\nEvaluation Metrics:")
-    print(f"Accuracy: {accuracy_score(true_classes, predicted_classes):.4f}")
-    print(f"Sensitivity (Recall, macro): {recall_score(true_classes, predicted_classes, average='macro'):.4f}")
-    print(f"Sensitivity (Recall, micro): {recall_score(true_classes, predicted_classes, average='micro'):.4f}")
-    print(f"F1 Score (macro): {f1_score(true_classes, predicted_classes, average='macro'):.4f}")
-    print(f"F1 Score (micro): {f1_score(true_classes, predicted_classes, average='micro'):.4f}")
-    print(f"Precision (macro): {precision_score(true_classes, predicted_classes, average='macro'):.4f}")
-    print(f"Precision (micro): {precision_score(true_classes, predicted_classes, average='micro'):.4f}")
 
-    # creating plots directory if it doesn't exist
+    # Prepare Hugging Face processor and model
+    processor = ViTImageProcessor.from_pretrained('google/vit-base-patch16-224')
+    model = ViTForImageClassification.from_pretrained(
+        'google/vit-base-patch16-224',
+        num_labels=NUM_CLASSES,
+        id2label={i: name for i, name in enumerate(CLASS_NAMES)},
+        label2id={name: i for i, name in enumerate(CLASS_NAMES)},
+        ignore_mismatched_sizes=True  # Add this to handle size mismatch
+    )
+    # Configure the classification head for our 4 classes
+    model.classifier = torch.nn.Linear(model.config.hidden_size, NUM_CLASSES)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+
+    # Custom PyTorch dataset
+    class WeatherDataset(Dataset):
+        def __init__(self, df, processor):
+            self.df = df.reset_index(drop=True)
+            self.processor = processor
+            # Convert string labels to numeric indices
+            self.df['label'] = self.df['label'].apply(lambda x: CLASS_NAMES.index(x))
+        def __len__(self):
+            return len(self.df)
+        def __getitem__(self, idx):
+            img_path = self.df.iloc[idx]['filepath']
+            label = self.df.iloc[idx]['label']  # Now label is already numeric
+            image = Image.open(img_path).convert('RGB')
+            inputs = self.processor(images=image, return_tensors="pt")
+            item = {k: v.squeeze(0) for k, v in inputs.items()}
+            item['labels'] = torch.tensor(label, dtype=torch.long)
+            return item
+
+    train_dataset = WeatherDataset(train_df, processor)
+    val_dataset = WeatherDataset(val_df, processor)
+    test_dataset = WeatherDataset(test_df, processor)
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+
+    EPOCHS_VIT = EPOCHS  # Use same EPOCHS as before
+    best_val_acc = 0.0
+    history = {'accuracy': [], 'val_accuracy': [], 'loss': [], 'val_loss': []}
+
+    for epoch in range(EPOCHS_VIT):
+        print(f"Epoch {epoch+1}/{EPOCHS_VIT}")
+        model.train()
+        train_loss, train_correct, train_total = 0.0, 0, 0
+        for batch in train_loader:
+            optimizer.zero_grad()
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+            preds = outputs.logits.argmax(dim=1)
+            train_correct += (preds == batch['labels']).sum().item()
+            train_total += batch['labels'].size(0)
+        epoch_train_loss = train_loss / len(train_loader)
+        epoch_train_acc = train_correct / train_total
+
+        # Validation
+        model.eval()
+        val_loss, val_correct, val_total = 0.0, 0, 0
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                outputs = model(**batch)
+                loss = outputs.loss
+                val_loss += loss.item()
+                preds = outputs.logits.argmax(dim=1)
+                val_correct += (preds == batch['labels']).sum().item()
+                val_total += batch['labels'].size(0)
+        epoch_val_loss = val_loss / len(val_loader)
+        epoch_val_acc = val_correct / val_total
+
+        history['accuracy'].append(epoch_train_acc)
+        history['val_accuracy'].append(epoch_val_acc)
+        history['loss'].append(epoch_train_loss)
+        history['val_loss'].append(epoch_val_loss)
+
+        print(f"Train Loss: {epoch_train_loss:.4f}, Train Acc: {epoch_train_acc:.4f}")
+        print(f"Val Loss: {epoch_val_loss:.4f}, Val Acc: {epoch_val_acc:.4f}")
+
+        if epoch_val_acc > best_val_acc:
+            best_val_acc = epoch_val_acc
+            torch.save(model.state_dict(), 'best_vit_model.pt')
+            print(f"Saved best model with validation accuracy: {best_val_acc:.4f}")
+
+    # Load best model
+    model.load_state_dict(torch.load('best_vit_model.pt'))
+    model.eval()
+
+    # Test evaluation
+    test_loss, test_correct, test_total = 0.0, 0, 0
+    all_preds = []
+    all_labels = []
+    with torch.no_grad():
+        for batch in test_loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            loss = outputs.loss
+            test_loss += loss.item()
+            preds = outputs.logits.argmax(dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(batch['labels'].cpu().numpy())
+            test_correct += (preds == batch['labels']).sum().item()
+            test_total += batch['labels'].size(0)
+    test_acc = test_correct / test_total
+    print(f"\nViT Test accuracy: {test_acc:.4f}")
+
+    # Metrics
+    print("\nGenerating ViT confusion matrix...")
+    cm = confusion_matrix(all_labels, all_preds)
+    print("\nEvaluation Metrics:")
+    print(f"Accuracy: {accuracy_score(all_labels, all_preds)*100:.4f}")
+    print(f"Sensitivity (Recall, macro): {recall_score(all_labels, all_preds, average='macro'):.4f}")
+    print(f"Sensitivity (Recall, micro): {recall_score(all_labels, all_preds, average='micro'):.4f}")
+    print(f"F1 Score (macro): {f1_score(all_labels, all_preds, average='macro'):.4f}")
+    print(f"F1 Score (micro): {f1_score(all_labels, all_preds, average='micro'):.4f}")
+    print(f"Precision (macro): {precision_score(all_labels, all_preds, average='macro'):.4f}")
+    print(f"Precision (micro): {precision_score(all_labels, all_preds, average='micro'):.4f}")
+    # --- Per-class metrics ---
+    print("\nDetailed Classification Report (per class):")
+    print(classification_report(all_labels, all_preds, target_names=CLASS_NAMES, digits=4))
+
+    # Plot confusion matrix
     plots_dir = BASE_DIR / 'plots'
     plots_dir.mkdir(exist_ok=True)
-    
-    # plotting confusion matrix
     plt.figure(figsize=(12, 10))
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=CLASS_NAMES)
     disp.plot(
-        cmap='Blues',  
+        cmap='Blues',
         values_format='d',
         include_values=True,
         xticks_rotation=45,
@@ -466,21 +608,17 @@ def train_evaluate_vit():
         text_kw={'size': 12},
         im_kw={'vmin': 0}
     )
-    plt.title('Vision Transformer Confusion Matrix', pad=20, size=14, weight='bold')
+    plt.title('ViT Confusion Matrix (Hugging Face)', pad=20, size=14, weight='bold')
     plt.ylabel('True Label', size=12, weight='bold')
     plt.xlabel('Predicted Label', size=12, weight='bold')
     plt.tight_layout()
-    
-    # saving confusion matrix plot
     plt.savefig(plots_dir / 'vit_confusion_matrix.png', dpi=300, bbox_inches='tight')
     plt.close()
-    
     print(f"ViT Confusion matrix saved to {plots_dir / 'vit_confusion_matrix.png'}")
-    
-    # saving training plots
+
+    # Save training plots (reuse existing function)
     save_training_plots(history, 'ViT')
-    
-    return vit_model
+    return model
 
 
 if __name__ == "__main__":
@@ -490,8 +628,8 @@ if __name__ == "__main__":
     print(f"CSV files: {TRAIN_CSV}, {VAL_CSV}, {TEST_CSV}")
     
     # choosing which model to train
-    train_resnet = True    # Set to False to skip ResNet training
-    train_vit = True      # Set to False to skip ViT training
+    train_resnet =  True    # Set to False to skip ResNet training
+    train_vit = False      # Set to False to skip ViT training
     
     # training models
     if train_resnet:

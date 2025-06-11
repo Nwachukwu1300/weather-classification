@@ -6,8 +6,8 @@ from pathlib import Path
 # Load the CSV files from splits directory
 splits_dir = Path('./splits')
 train_df = pd.read_csv(splits_dir / 'train.csv')
-val_df = pd.read_csv(splits_dir / 'val.csv')
-test_df = pd.read_csv(splits_dir / 'test.csv')
+val_df = pd.read_csv(splits_dir / 'val_fixed.csv')
+test_df = pd.read_csv(splits_dir / 'test_fixed.csv')
 
 # Class mapping
 class_names = {0: 'clear', 1: 'rain', 2: 'fog', 3: 'snow'}
