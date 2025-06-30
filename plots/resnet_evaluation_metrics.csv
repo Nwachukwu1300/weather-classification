@@ -1,0 +1,10 @@
+Class,Precision,Recall,F1-Score,Support
+clear,0.9665,0.9286,0.9472,280
+rain,0.9560,0.9355,0.9457,279
+fog,0.8367,0.4409,0.5775,279
+snow,0.6332,0.9713,0.7666,279
+
+Metric,Value
+Accuracy,0.8192
+Macro Avg F1,0.8092
+Weighted Avg F1,0.8094

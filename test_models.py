@@ -18,6 +18,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import optuna
 from optuna.trial import Trial
+from sklearn.metrics import roc_curve, auc
+from sklearn.preprocessing import label_binarize
 
 BASE_DIR = Path(os.getcwd())
 # CSV files with dataset splits
@@ -181,39 +183,43 @@ def objective(trial: Trial):
     return max(history.history['val_accuracy'])
 
 def train_evaluate_resnet():
-    """Train and evaluate ResNet model with Optuna optimization"""
+    """Train and evaluate ResNet model with best hyperparameters (Optuna code commented out)"""
     print("\n==================================================")
-    print("OPTIMIZING RESNET MODEL WITH OPTUNA")
+    print("TRAINING RESNET MODEL WITH BEST HYPERPARAMETERS (Optuna code commented out)")
     print("==================================================")
     
-    # Create Optuna study with more patient pruner
-    study = optuna.create_study(
-        direction='maximize',
-        pruner=optuna.pruners.MedianPruner(
-            n_startup_trials=5,  # More startup trials
-            n_warmup_steps=3,    # More warmup steps
-            interval_steps=1
-        )
-    )
-    
-    # Run optimization with longer timeout
-    study.optimize(
-        objective,
-        n_trials=10,
-        timeout=72000,  # Increased to 2 hours
-        show_progress_bar=True
-    )
-    
-    print("\nBest trial:")
-    trial = study.best_trial
-    
-    print("  Value: ", trial.value)
-    print("  Params: ")
-    for key, value in trial.params.items():
-        print(f"    {key}: {value}")
-    
-    # Train final model with best parameters
-    print("\nTraining final model with best parameters...")
+    # --- Commented out Optuna optimization ---
+    # study = optuna.create_study(
+    #     direction='maximize',
+    #     pruner=optuna.pruners.MedianPruner(
+    #         n_startup_trials=5,  # More startup trials
+    #         n_warmup_steps=3,    # More warmup steps
+    #         interval_steps=1
+    #     )
+    # )
+    # study.optimize(
+    #     objective,
+    #     n_trials=10,
+    #     timeout=72000,  # Increased to 2 hours
+    #     show_progress_bar=True
+    # )
+    # print("\nBest trial:")
+    # trial = study.best_trial
+    # print("  Value: ", trial.value)
+    # print("  Params: ")
+    # for key, value in trial.params.items():
+    #     print(f"    {key}: {value}")
+    # print("\nTraining final model with best parameters...")
+
+    # --- Use best hyperparameters found previously ---
+    best_params = {
+        'learning_rate': 0.000912,  # Example best value
+        'dropout_rate': 0.3591,
+        'dense_units': 650,
+        'batch_size': 64,
+        'num_dense_layers': 1,
+        'dense_units_multiplier': 0.532
+    }
     
     # loading datasets
     train_df = load_dataset_from_csv(TRAIN_CSV, is_training=True)
@@ -231,7 +237,7 @@ def train_evaluate_resnet():
         x_col="filepath",
         y_col="label",
         target_size=(IMG_SIZE, IMG_SIZE),
-        batch_size=trial.params['batch_size'],
+        batch_size=best_params['batch_size'],
         class_mode="sparse",
         shuffle=True
     )
@@ -241,7 +247,7 @@ def train_evaluate_resnet():
         x_col="filepath",
         y_col="label",
         target_size=(IMG_SIZE, IMG_SIZE),
-        batch_size=trial.params['batch_size'],
+        batch_size=best_params['batch_size'],
         class_mode="sparse",
         shuffle=False
     )
@@ -251,7 +257,7 @@ def train_evaluate_resnet():
         x_col="filepath",
         y_col="label",
         target_size=(IMG_SIZE, IMG_SIZE),
-        batch_size=trial.params['batch_size'],
+        batch_size=best_params['batch_size'],
         class_mode="sparse",
         shuffle=False
     )
@@ -264,11 +270,11 @@ def train_evaluate_resnet():
     x = tf.keras.layers.Lambda(hub_layer, output_shape=(2048,))(inputs)
     
     # Add multiple dense layers with best parameters
-    current_units = trial.params['dense_units']
-    for i in range(trial.params['num_dense_layers']):
+    current_units = best_params['dense_units']
+    for i in range(best_params['num_dense_layers']):
         x = tf.keras.layers.Dense(current_units, activation='relu')(x)
-        x = tf.keras.layers.Dropout(trial.params['dropout_rate'])(x)
-        current_units = int(current_units * trial.params['dense_units_multiplier'])
+        x = tf.keras.layers.Dropout(best_params['dropout_rate'])(x)
+        current_units = int(current_units * best_params['dense_units_multiplier'])
     
     outputs = tf.keras.layers.Dense(len(CLASS_NAMES), activation='softmax')(x)
 
@@ -276,7 +282,7 @@ def train_evaluate_resnet():
     
     # compiling model with best learning rate
     resnet_model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=trial.params['learning_rate']),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=best_params['learning_rate']),
         loss='sparse_categorical_crossentropy',
         metrics=['accuracy']
     )
@@ -323,18 +329,72 @@ def train_evaluate_resnet():
     cm = confusion_matrix(true_classes, predicted_classes)
     
     # --- Additional evaluation metrics ---
+    acc = accuracy_score(true_classes, predicted_classes)
+    recall_macro = recall_score(true_classes, predicted_classes, average='macro')
+    recall_micro = recall_score(true_classes, predicted_classes, average='micro')
+    f1_macro = f1_score(true_classes, predicted_classes, average='macro')
+    f1_micro = f1_score(true_classes, predicted_classes, average='micro')
+    precision_macro = precision_score(true_classes, predicted_classes, average='macro')
+    precision_micro = precision_score(true_classes, predicted_classes, average='micro')
     print("\nEvaluation Metrics:")
-    print(f"Accuracy: {accuracy_score(true_classes, predicted_classes):.4f}")
-    print(f"Recall (macro): {recall_score(true_classes, predicted_classes, average='macro'):.4f}")
-    print(f"Recall (micro): {recall_score(true_classes, predicted_classes, average='micro'):.4f}")
-    print(f"F1 Score (macro): {f1_score(true_classes, predicted_classes, average='macro'):.4f}")
-    print(f"F1 Score (micro): {f1_score(true_classes, predicted_classes, average='micro'):.4f}")
-    print(f"Precision (macro): {precision_score(true_classes, predicted_classes, average='macro'):.4f}")
-    print(f"Precision (micro): {precision_score(true_classes, predicted_classes, average='micro'):.4f}")
+    print(f"Accuracy: {acc:.4f}")
+    print(f"Recall (macro): {recall_macro:.4f}")
+    print(f"Recall (micro): {recall_micro:.4f}")
+    print(f"F1 Score (macro): {f1_macro:.4f}")
+    print(f"F1 Score (micro): {f1_micro:.4f}")
+    print(f"Precision (macro): {precision_macro:.4f}")
+    print(f"Precision (micro): {precision_micro:.4f}")
     
     # --- Per-class metrics ---
     print("\nDetailed Classification Report (per class):")
+    class_report = classification_report(true_classes, predicted_classes, target_names=CLASS_NAMES, digits=4, output_dict=True)
     print(classification_report(true_classes, predicted_classes, target_names=CLASS_NAMES, digits=4))
+    
+    # Save evaluation metrics to CSV
+    import csv
+    plots_dir = BASE_DIR / 'plots'
+    plots_dir.mkdir(exist_ok=True)
+    metrics_csv = plots_dir / 'resnet_evaluation_metrics.csv'
+    with open(metrics_csv, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['Class', 'Precision', 'Recall', 'F1-Score', 'Support'])
+        for cls in CLASS_NAMES:
+            row = class_report[cls]
+            writer.writerow([cls, f"{row['precision']:.4f}", f"{row['recall']:.4f}", f"{row['f1-score']:.4f}", int(row['support'])])
+        writer.writerow([])
+        writer.writerow(['Metric', 'Value'])
+        writer.writerow(['Accuracy', f"{acc:.4f}"])
+        writer.writerow(['Macro Avg F1', f"{f1_macro:.4f}"])
+        writer.writerow(['Weighted Avg F1', f"{class_report['weighted avg']['f1-score']:.4f}"])
+    print(f"Evaluation metrics saved to {metrics_csv}")
+    
+    # --- ROC Curve (One-vs-Rest) ---
+    print("\nPlotting ROC curve...")
+    n_classes = len(CLASS_NAMES)
+    true_classes_bin = label_binarize(true_classes, classes=list(range(n_classes)))
+    fpr = dict()
+    tpr = dict()
+    roc_auc = dict()
+    for i in range(n_classes):
+        fpr[i], tpr[i], _ = roc_curve(true_classes_bin[:, i], predictions[:, i])
+        roc_auc[i] = auc(fpr[i], tpr[i])
+    plt.figure(figsize=(8, 6))
+    colors = ['blue', 'red', 'green', 'orange']
+    for i, color in zip(range(n_classes), colors):
+        plt.plot(fpr[i], tpr[i], color=color, lw=2,
+                 label=f'ROC curve of class {CLASS_NAMES[i]} (area = {roc_auc[i]:0.2f})')
+    plt.plot([0, 1], [0, 1], 'k--', lw=2)
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ResNet Multi-class ROC Curve')
+    plt.legend(loc="lower right")
+    plt.tight_layout()
+    roc_path = plots_dir / 'resnet_roc_curve.png'
+    plt.savefig(roc_path)
+    plt.close()
+    print(f"ROC curve saved to {roc_path}")
     
     # creating plots directory if it doesn't exist
     plots_dir = BASE_DIR / 'plots'
