@@ -1,4 +1,4 @@
-# Weather Image Classification
+# Weather Image Classification for CCTV Road images
 
 A deep learning project for classifying weather conditions from images using ResNet and Vision Transformer (ViT) models.
 
@@ -11,37 +11,6 @@ This project implements a weather classification system that can identify four d
 - **Snow** - Snowy conditions
 
 The system uses state-of-the-art deep learning models including ResNet-50 and Vision Transformer (ViT) for accurate weather classification.
-
-## Project Structure
-
-```
-.
-├── README.md                      # This file
-├── requirements.txt               # Python dependencies
-├── weather_preprocessing.py       # Data preprocessing and splitting
-├── augment_images.py             # Data augmentation script
-├── evaluate_resnet.py            # ResNet model evaluation
-├── test_models.py                # Comprehensive model testing
-├── fix_paths.py                  # Path fixing utilities
-├── show_distribution.py          # Dataset distribution visualization
-├── best_resnet_model.h5          # Trained ResNet model
-├── best_vit_model.h5            # Trained ViT model
-├── train_augmented_fixed.csv     # Training data with augmentation
-├── dataset_distribution.png      # Dataset distribution visualization
-├── clear/                        # Clear weather images
-├── rain/                         # Rain weather images
-├── fog/                          # Fog weather images
-├── snow/                         # Snow weather images
-├── augmented_images/             # Data augmentation outputs
-├── splits/                       # Train/validation/test splits
-└── plots/                        # Evaluation plots and metrics
-    ├── resnet_roc_curve.png
-    ├── resnet_confusion_matrix.png
-    ├── resnet_training_history.png
-    ├── resnet_evaluation_metrics.csv
-    ├── vit_confusion_matrix.png
-    └── ViT_training_history.png
-```
 
 ## Features
 
